@@ -750,7 +750,7 @@ void parseGetAllGroupsResponseV2(resp, Map data=null) {
                      "${roomOrZone}Id": roomOrZoneData.id, id_v1: roomOrZoneData.id_v1]
                }
                else {
-                  if (logEnable) log.debug "No grouped_light service found for {roomOrZone} ID ${roomOrZoneData.id}"
+                  if (logEnable) log.debug "No grouped_light service found for ${roomOrZone} ID ${roomOrZoneData.id}"
                }
             }
             if (roomOrZone== "room") state.allRooms = roomsOrZones

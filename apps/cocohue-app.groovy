@@ -18,8 +18,9 @@
  *
  * =======================================================================================
  *
- *  Last modified: 2025-09-07
+ *  Last modified: 2025-09-13
  *  Changelog:
+ *  v5.4.0 - Add mDNS for discovery (needed for Bridge Pro, usable on all but V1 and old V2 firmware)
  *  v5.3.4 - Prefer HTTPS by default or if set to use V2 API for SSE (new Pro Bridge does not support HTTP so would fail)
  *  v5.3.3 - Prefer HTTP if not set to use V2 API; begin to add mDNS listener (commented out, to finish later)
  *  v5.3.2 - Add option for spacing between metered HTTP calls
@@ -326,16 +327,23 @@ void upgradeCCHv1DNIsToV2ResponseHandler(AsyncResponse resp, data=null) {
    }
 }
 
-// Used to be saved in state but removed because not necessary--can retrieve easily:
-/** Returns last 6 of MAC address, similar to built-in integration **/
+// Previous versions saved `bridgeID` in state but removed because not necessary--can retrieve easily:
+/** Returns last 6 of Bridge ID. Previous versions of integration saved entire MAC, which usually matched most of Bridge ID. However, Bridge
+  * Pro has two MACs, so one will be different. ID is stable. This method accounts for various ways previous versions may have saved this data
+  * and returns last 6 of ID, matching last 6 of old MACs and Bridge IDs or last 6 of modern Bridge IDs. (Looking at the full ID would be great,
+  * but last 6 is probably safe since Hue seems to do this and the first set of characters are a vendor prefix in MAC or vendor prefix plus
+  * filler characters in ID.)
+  */
 String getBridgeId() {
-   if (state.bridgeMAC) {
-      return state.bridgeMAC.drop(6) // return last 6 (drop first 6) of MAC
+   if (state.bridgeMAC != null) {
+      if (state.bridgeMAC.length() > 6) state.bridgeMAC.drop(6) // Should be 12-characater MAC; drop first 6 to return last 6
+      else return state.bridgeMAC                               // Should be 6-character MAC; return as-is
    }
    else {
-      log.warn "getBridgeId() called but no MAC saved; cannot retrieve ID"
+      log.warn "getBridgeId() called but no ID or MAC saved; cannot retrieve ID"
    }
 }
+
 
 void initialize() {
    log.debug "initialize()"
@@ -343,8 +351,6 @@ void initialize() {
    unsubscribe("ssdpBridgeHandler") // just in case leftover from pre-2.4.0 integration (remove eventually since should now be removed as part of convertBuiltIn... code?)
    state.remove("discoveredBridges")
    if (settings.useSSDP == true || settings["useSSDP"] == null) {
-      // TODO: Separate mDNS and SSDP and pick only one, prefer mDNS if available (V2 bridge, maybe newer FW only?)
-      // registerMDNSListener("_hue._tcp")
       if (settings["keepSSDP"] != false) {
          if (logEnable == true) log.debug "Subscribing to SSDP..."
          subscribe(location, "ssdpTerm.urn:schemas-upnp-org:device:basic:1", "ssdpHandler")
@@ -440,25 +446,39 @@ void scheduleRefresh() {
    }
 }
 
-void sendBridgeDiscoveryCommand() {
+/** 
+ * Sends SSDP discovery command on network to find Bridges, and also checks hub's mDNS cache. The mDNS
+ * method is preferred (by Hue), but older firmware and V1 Bridges only support SSDP. Keep both for now.
+ */
+void sendBridgeDiscoveryCommand(Map optionns = null) {
+   // Try SSDP for older bridges (or networks where mDNS doesn't work):
     sendHubCommand(new hubitat.device.HubAction("lan discovery ssdpTerm.urn:schemas-upnp-org:device:basic:1",
                    hubitat.device.Protocol.LAN))
     state.lastDiscoCommand = now()
+   // For SSDP, `ssdpHandler()` will fetch more info if/when hear back
+
+    // Try modern mDNS method also:
+    Map<String, Object> mDNSEntries = hubitat.helper.NetworkUtils.getRawMDNSEndpointsByMACForServiceType("_hue._tcp.local.")
+    mDNSEntries.each {
+         if (logEnable == true) log.debug "mDNS entry: $it"
+         // For mDNS, fetch info similar to would if heard from SSDP to maintain maximum compatibility with existing code:
+         sendBridgeInfoRequest(ip: it.value.ip4Address)
+    }
 }
 
-/** Sends SSDP discovery command, optionally checking if was done in last few minutes and ignoring if so;
-    intended to be called by child devices (e.g., Bridge) if notice problems suggesting Bridge IP may have
-    changed
-*/
+/**
+ * Sends SSDP discovery command, optionally checking if was done in last few minutes and ignoring if so;
+ * intended to be called by child devices (e.g., Bridge) if notice problems suggesting Bridge IP may have
+ * changed
+ */
 void sendBridgeDiscoveryCommandIfSSDPEnabled(Boolean checkIfRecent=true) {
    if (logEnable == true) log.debug("sendBridgeDiscoveryCommandIfSSDPEnabled($checkIfRecent)")
    if (settings.useSSDP != false) {
       if (checkIfRecent == true) {
          Long lastDiscoThreshold = 300000 // Start with 5 minutes
-         if (state.failedDiscos >= 3 && state.failedDiscos < 4) lastDiscoThreshold = 600000 // start trying every 5 min
-         else if (state.failedDiscos >= 4 && state.failedDiscos < 6) lastDiscoThreshold = 1200000 // gradually increase interval if keeps failing...
-         else if (state.failedDiscos >= 6 && state.failedDiscos < 18) lastDiscoThreshold = 3600000 // 1 hour now
-         else lastDiscoThreshold =  7200000 // cap at 2 hr if been more than ~12 hr without Bridge
+         if (state.failedDiscos >= 3 && state.failedDiscos < 5) lastDiscoThreshold = 600000 // start trying every 10 min
+         else if (state.failedDiscos >= 4 && state.failedDiscos < 8) lastDiscoThreshold = 1200000 // gradually increase interval if keeps failing...
+         else lastDiscoThreshold = 3600000 // cap at 1 hour if been a while since succeeded
          if (!(state.lastDiscoCommand) || (now() - state.lastDiscoCommand >= lastDiscoThreshold)) {
             sendBridgeDiscoveryCommand()
          }
@@ -474,7 +494,6 @@ void hubRestartHandler(evt) {
    if (state.useV2) {
       runIn(Math.round(Math.random() * 20) + 35, "sendUpdateBridgeCacheRequest") // do in about 35-55 seconds
    }
-   //registerMDNSListener("_hue._tcp")
 }
 
 /** Calls method on Bridge child device to get new cache (of /resources endpoint if V2 API enabled)
@@ -538,8 +557,6 @@ def pageAddBridge() {
                refreshInterval: ((settings.useSSDP == false || selectedDiscoveredBridge) ? null : state.authRefreshInterval),
                nextPage: "pageLinkBridge") {
       section("Add Hue Bridge") {
-         // TODO: Switch to mDNS, leave SSDP as legacy option for v1 bridges if needed; consider making separate setting?
-         input name: "useSSDP", type: "bool", title: "Discover Hue Bridges automatically", defaultValue: true, submitOnChange: true
          if (settings.useSSDP != false) {
             if (!(state.discoveredBridges)) {
                paragraph "Please wait while Hue Bridges are discovered..."
@@ -547,7 +564,7 @@ def pageAddBridge() {
                paragraph "<script>\$('button[name=\"_action_next\"]').hide()</script>"
             }
             else {
-               // TODO: show on separate page since checked devices will uncheck on page refresh
+               // TODO: show on separate page since checked devices will (?) uncheck on page refresh
                input name: "selectedDiscoveredBridge", type: "enum", title: "Discovered bridges:", options: state.discoveredBridges,
                      multiple: false, submitOnChange: true
                if (!(settings.selectedDiscoveredBridge)) {
@@ -585,9 +602,9 @@ def pageAddBridge() {
          }
       }
       section("Advanced", hideable: true, hidden: true || !(settings.useEventStream == false || settings.useSSDP == false)) {
-         // TODO: Switch to mDNS, leave SSDP as legacy option for v1 bridges if needed; consider making separate setting?
+         // Setting name says SSDP, but actually uses both mDNS and SSDP now:
          input name: "useSSDP", type: "bool", title: "Discover Hue Bridges automatically (recommended)", defaultValue: true, submitOnChange: true
-         paragraph "<small>Disabling the above option will disable automatic discovery of Hue Bridges on your LAN; recommended only if using static or reserved DHCP IP address on Bridge.</small>"
+         paragraph "<small>Disabling the above option will allow specifying an IP address for your Bridge instead of relying on discovery (mDNS or SSDP); recommended only if using static or reserved DHCP IP address on Bridge.</small>"
          // Setting name (useEventStream) must match one used on manage bridge page! Presenting here so can be turned off before adding if desired since cannot be disabled after:
          input name: "useEventStream", type: "bool", title: "Use Hue V2 API if available (recommended)", defaultValue: true, submitOnChange: true
       }     
@@ -609,8 +626,8 @@ def pageReAddBridge() {
       section("Options") {
          paragraph("You have chosen to edit the Bridge IP address (if automatic discovery is not selected) or " +
                "re-discover the Bridge (if discovery is enabled; usually happens automatically). The Bridge you choose " +
-               "must be the same as the one with which the app and devices were originally configured. To switch to " +
-               "a completely different Bridge, install a new instance of the app instead.")
+               "must be the same as the one with which the app and devices were originally configured (or a new Bridge to " +
+               "which your configuration was migrated). To switch to a completely different Bridge, install a new instance of the app instead.")
          paragraph("If you see \"unauthorized user\" errors, try enabling the option below. In most cases, you can " +
                "continue without this option. In all cases, an existing Bridge device will be either updated to match " +
                "your selection (on the next page) or re-created if it does not exist.")
@@ -716,8 +733,6 @@ def pageSupportOptions() {
          paragraph "Scenes:", width: 3
          input name: "btnFetchScenesInfo", type: "button", title: "Fetch Scenes Info", width: 4
          input name: "btnLogScenesInfo", type: "button", title: "Log Scenes Cache", width: 5
-         paragraph "mDNS:", width: 3
-         input name: "btnLogMDNSEntries", type: "button", title: "Log mDNS Entries", width: 9
          if (state.useV2) {
             paragraph "Sensors:", width: 3
             input name: "btnFetchSensorsInfo", type: "button", title: "Fetch Motion Sensors Info", width: 4
@@ -825,8 +840,8 @@ def pageManageBridge() {
                       defaultValue: 60
          if (state.useV2 == true) {
             input name: "useV1Polling", type: "bool", title: "If polling enabled, use V1 API for polling (recommended)", defaultValue: true
-            paragraph "It is recommended to keep polling enabled, even when the \"${v2SettingText}\" setting is enabled, as it will reduce the possibility of missed events from Hue. " +
-               "It is also currently recommended to use the V1 API for polling (the V2 API will still be used for other functions where possible). Both of these settings are set to their recommended values by default."
+            paragraph "<small>It is recommended to keep polling enabled, even when the \"${v2SettingText}\" setting is enabled, as it will reduce the possibility of missed events from Hue. " +
+               "It is also currently recommended to use the V1 API for polling (the V2 API will still be used for other functions where possible). Both of these settings are set to their recommended values by default.</small>"
          }
          else {
             paragraph "<small>NOTE: Polling is recommended if \"${v2SettingText}\" not enabled, as changes made outside Hubitat will not be reflected on Hubitat until after a poll.</small>"
@@ -1545,7 +1560,6 @@ void sendUsernameRequest(String protocol="https", Integer port=null) {
       contentType: "application/json",
       path: "/api",
       body: [devicetype: userDesc],
-      contentType: 'text/xml',
       ignoreSSLIssues: true,
       timeout: 15
    ]
@@ -1583,9 +1597,12 @@ void parseUsernameResponse(resp, data) {
  *  (when parsed in parseBridgeInfoResponse if createBridge == true) or to add to the list
  *  of discovered Bridge devices (when createBridge == false). protocol, ip, and port are optional
  *  and will default to getBridgeData() values if not specified
- *  @param options Possible values: createBridge (default true), protocol (default "https"), ip, port
+ *  @param options Possible values:
+ *        - ip (required): IP address of Bridge
+ *        - protocol: one of "http" or "https" (default)
+ *        - port: port (defaults to default for protocol/omitted)
  */
-void sendBridgeInfoRequest(Map options) {
+void sendBridgeInfoRequest(Map options = null) {
    if (logEnable == true) log.debug "sendBridgeInfoRequest()"
    String fullHost
    if (options?.port) {
@@ -1597,7 +1614,7 @@ void sendBridgeInfoRequest(Map options) {
    Map params = [
       uri: fullHost,
       path: "/api/0/config",  // does not require authentication (API key/username)
-      contentType: "text/xml",
+      contentType: "application/json",
       ignoreSSLIssues: true,
       timeout: 15
    ]
@@ -1619,7 +1636,7 @@ void sendBridgeInfoRequest(Map options) {
 */
 /** Parses response from GET of /api/0/config endpoint on the Bridge;
  *  verifies that device is a Hue Bridge (modelName contains "Philips Hue Bridge")
- * and obtains MAC address for use in creating device name
+ * and obtains Bridge ID for use in creating device name
  */
 void parseBridgeInfoResponse(resp, Map data) {
    //resp?.properties.each { log.trace it }
@@ -1641,19 +1658,25 @@ void parseBridgeInfoResponse(resp, Map data) {
    }
 
    String friendlyBridgeName = body.name ?: "Unknown Bridge"
-   String bridgeMAC = body.mac.replaceAll(':', '').toUpperCase()
-   // Not using "full" bridge ID for this to retain V1 compatibility, but could(?):
-   String bridgeID = bridgeMAC.drop(6)   // last (12-6=) 6 of MAC serial
+   // This isn't necessarily the (last part of the) MAC anymore but used to match up 
+   // (Bridge Pro supports Wi-Fi and Ethernet; ID seems to match one and should be stable on all models and connectivity methods)
+   String bridgeID
+   // Take last 6 characters of ID (would love to use full, but have to keep this way for legacy integration compatibility):
+   bridgeID = (body.bridgeid != null && body.bridgeid.length() > 6) ? body.bridgeid?.drop(body.bridgeid.length() - 6) : nil
+    // Last-ditch effort if actual ID failed (not sure if ID has always been available?)
+    if (bridgeID == null) {
+        bridgeID = body.mac.replaceAll(':', '').toUpperCase()
+    }
    String swVersion = body.swversion // version 1948086000 means v2 API is available
    DeviceWrapper bridgeDevice = getChildDevice("${DNI_PREFIX}/${app.id}")
 
    if (data?.createBridge) {
-      if (logEnable == true) log.debug "    Attempting to create Hue Bridge device for $bridgeMAC"
-      if (!bridgeMAC) {
+      if (logEnable == true) log.debug "    Attempting to create Hue Bridge device for $bridgeID"
+      if (!bridgeID) {
          log.error "    Unable to retrieve MAC address for Bridge. Exiting before creation attempt."
          return
       }
-      state.bridgeMAC = bridgeMAC
+      state.bridgeMAC = bridgeID
       try {
          if (!bridgeDevice) bridgeDevice = addChildDevice(NAMESPACE, DRIVER_NAME_BRIDGE, "${DNI_PREFIX}/${app.id}", null,
                               [label: """${DRIVER_NAME_BRIDGE} ${getBridgeId()}${friendlyBridgeName ? " ($friendlyBridgeName)" : ""}""", name: DRIVER_NAME_BRIDGE])
@@ -1688,43 +1711,51 @@ void parseBridgeInfoResponse(resp, Map data) {
    }
    else { // createBridge = false, so either in discovery (so add to list instead) or received as part of regular app operation (so check if IP address changed if using Bridge discovery)
       if (!(state.bridgeLinked)) { // so in discovery
-         if (logEnable == true) log.debug "  Adding Bridge with MAC $bridgeMAC ($friendlyBridgeName) to list of discovered Bridges"
+         if (logEnable == true) log.debug "  Adding Bridge with ID $bridgeID ($friendlyBridgeName) to list of discovered Bridges"
          if (!state.discoveredBridges) state.discoveredBridges = []
          if (!(state.discoveredBridges.any { it.containsKey(ipAddress) })) {
-            state.discoveredBridges.add([(ipAddress): "${friendlyBridgeName} - ${bridgeMAC}"])
+            state.discoveredBridges.add([(ipAddress): "${friendlyBridgeName} - ${bridgeID}"])
          }
       }
       else { // Bridge already added, so likely added with discovery; check if IP changed
-         if (logEnable == true) log.debug "  Bridge already added; seaching if Bridge matches MAC $bridgeMAC"
-         if (bridgeMAC == state.bridgeMAC && bridgeMAC != null) { // found a match for this Bridge, so update IP:
+         if (logEnable == true) log.debug "  Bridge already added; seaching if Bridge matches ID $bridgeID"
+         if (bridgeID == getBridgeId() && bridgeID != null) { // found a match for this Bridge, so update IP:
             if (data?.ip && settings.useSSDP != false) {
                state.ipAddress = data.ip
-               if (logEnable == true) log.debug "  Bridge MAC matched. Setting IP as ${state.ipAddress}"
+               if (logEnable == true) log.debug "  Bridge ID matched. Setting IP as ${state.ipAddress}"
             }
             else {
-                if (logEnable == true) log.debug "   Bridge MAC matched but not changing IP because not configured to use manual setup. `settings.useSSDP` = ${settings.useSSDP}"
+                if (logEnable == true) log.debug "   Bridge ID matched but not changing IP because not configured to use manual setup. `settings.useSSDP` = ${settings.useSSDP}"
             }
             String dataSwversion = bridgeDevice.getDataValue("swversion")
             if (dataSwversion != swVersion && swVersion) bridgeDevice.updateDataValue("swversion", swVersion)
             state.remove("failedDiscos")
          }
          else {
-            state.failedDiscos= state.failedDiscos ? state.failedDiscos += 1 : 1
-            if (logEnable == true) log.debug "  No matching Bridge MAC found for ${state.bridgeMAC}. failedDiscos = ${state.failedDiscos}"
+            state.failedDiscos = state.failedDiscos ? state.failedDiscos += 1 : 1
+            if (logEnable == true) log.debug "  No matching Bridge ID found for ${getBridgeId()}. failedDiscos = ${state.failedDiscos}"
          }
       }
    }
 }
 
-/** Handles response from SSDP (sent to discover Bridge) */
+/** Handles response from SSDP (sent to discover V1 Bridge or older V2) */
 void ssdpHandler(evt) {
    Map parsedMap = parseLanMessage(evt?.description)
+   Map<String, Object> mDNSEntries = hubitat.helper.NetworkUtils.getRawMDNSEndpointsByMACForServiceType("_hue._tcp.local.")
    if (parsedMap) {
       String ip = "${convertHexToIP(parsedMap?.networkAddress)}"
       String ssdpPath = parsedMap.ssdpPath
       if (ip) {
-         if (logEnable == true) log.debug "Device at $ip responded to SSDP; sending info request to see if is Hue Bridge"
-         sendBridgeInfoRequest(ip: ip)
+         mDNSEntries.each {
+            if (mDNSEntries.any { it.value.ip4Address == ip }) {
+               if (logEnable == true) log.debug "Device at $ip already found via mDNS; skipping post-SSDP data fetch"
+            }
+            else {
+               if (logEnable == true) log.debug "Device at $ip responded to SSDP; sending info request to see if is Hue Bridge"
+               sendBridgeInfoRequest(ip: ip)
+            }
+         }
       }
       else {
          if (logEnable == true) log.debug "In ssdpHandler() but unable to obtain IP address from device response: $parsedMap"
@@ -1733,7 +1764,6 @@ void ssdpHandler(evt) {
    else {
       if (logEnable == true) log.debug "In ssdpHandler() but unable to parse LAN message from event: $evt?.description"
    }
-   //log.trace parsedMap
 }
 
 private String convertHexToIP(hex) {
@@ -2026,7 +2056,6 @@ private Boolean checkIfValidPUTResponse(hubitat.scheduling.AsyncResponse resp) {
       else {
          isOK = false
          log.warn("HTTP status code ${resp.status} from Bridge")
-         // TODO: Update for mDNS if/when switch:
          if (resp?.status >= 400) sendBridgeDiscoveryCommandIfSSDPEnabled(true) // maybe IP changed, so attempt rediscovery 
          setBridgeOnlineStatus(false)
       }
@@ -2128,11 +2157,6 @@ void appButtonHandler(btn) {
          else {
             log.debug "EMPTY BRIDGE CACHE ON BRIDGE"
          }
-         break
-      case "btnLogMDNSEntries":
-         log.debug "Logging mDNS entries for _hue._tcp:"
-         registerMDNSListener("_hue._tcp")
-         log.debug getMDNSEntries("_hue._tcp")
          break
       case "btnRetryV2APIEnable":
          app.updateSetting("logEnable", true)
