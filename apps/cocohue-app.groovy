@@ -18,8 +18,9 @@
  *
  * =======================================================================================
  *
- *  Last modified: 2025-09-13
+ *  Last modified: 2025-09-20
  *  Changelog:
+ *  v5.4.1 - Fix discovery time recheck threshold logic
  *  v5.4.0 - Add mDNS for discovery (needed for Bridge Pro, usable on all but V1 and old V2 firmware)
  *  v5.3.4 - Prefer HTTPS by default or if set to use V2 API for SSE (new Pro Bridge does not support HTTP so would fail)
  *  v5.3.3 - Prefer HTTP if not set to use V2 API; begin to add mDNS listener (commented out, to finish later)
@@ -392,7 +393,7 @@ void initialize() {
             // TODO: Re-time this and retryUpgradeCCHV1... method or figure out some way to avoid unschedule!
             runIn(15, "initialize") // re-check version after has time to fetch in case upgrading from old version without this value
          }
-         else if (!(settings.useEventStream == false) && bridgeSwVersion.isInteger() && Integer.parseInt(bridgeSwVersion) >= minV2SwVersion) {
+         else if (bridgeSwVersion.isInteger() && Integer.parseInt(bridgeSwVersion) >= minV2SwVersion) {
             state.useV2 = true
          }
       }
@@ -476,8 +477,8 @@ void sendBridgeDiscoveryCommandIfSSDPEnabled(Boolean checkIfRecent=true) {
    if (settings.useSSDP != false) {
       if (checkIfRecent == true) {
          Long lastDiscoThreshold = 300000 // Start with 5 minutes
-         if (state.failedDiscos >= 3 && state.failedDiscos < 5) lastDiscoThreshold = 600000 // start trying every 10 min
-         else if (state.failedDiscos >= 4 && state.failedDiscos < 8) lastDiscoThreshold = 1200000 // gradually increase interval if keeps failing...
+         if (state.failedDiscos == null || (state.failedDiscos >= 5 && state.failedDiscos < 9)) lastDiscoThreshold = 600000 // start trying every 10 min
+         else if (state.failedDiscos >= 10 && state.failedDiscos < 14) lastDiscoThreshold = 1200000 // gradually increase interval if keeps failing...
          else lastDiscoThreshold = 3600000 // cap at 1 hour if been a while since succeeded
          if (!(state.lastDiscoCommand) || (now() - state.lastDiscoCommand >= lastDiscoThreshold)) {
             sendBridgeDiscoveryCommand()
@@ -522,6 +523,7 @@ def pageFirstPage() {
    state.authRefreshInterval = 5
    state.discoTryCount = 0
    state.authTryCount = 0
+   state.remove("reAddingBridge")
    // Shouldn't happen with installOnOpen: true, but just in case:
    if (app.getInstallationState() == "INCOMPLETE") {
       dynamicPage(name: "pageIncomplete", uninstall: true, install: true) {
@@ -572,7 +574,7 @@ def pageAddBridge() {
                   else paragraph("Select a Hue Bridge above to begin adding it to your Hubitat Elevation hub.")
                }
                else {
-                  if (/*!state.bridgeLinked ||*/ !state.bridgeAuthorized)
+                  if (!state.bridgeAuthorized)
                         paragraph("<strong>Press the button on your Bridge</strong> and then select \"Next\" to continue.")
                   else
                         paragraph("Select \"Next\" to continue.")
@@ -616,6 +618,7 @@ def pageReAddBridge() {
    state.authRefreshInterval = 5
    state.discoTryCount = 0
    state.authTryCount = 0
+   state.reAddingBridge = true
    if (settings.useSSDP == true || settings.useSSDP == null && state.discoTryCount < 5) {
       if (logEnable == true) log.debug "Subscribing to and sending SSDP discovery..."
       subscribe(location, "ssdpTerm.urn:schemas-upnp-org:device:basic:1", "ssdpHandler")
@@ -639,6 +642,10 @@ def pageReAddBridge() {
 
 def pageLinkBridge() {
    if (logEnable == true) log.debug "Beginning bridge link process..."
+   if (state.reAddingBridge) {
+      state.remove("bridgeMAC")
+      state.remove("reAddingBridge")
+   }
    String ipAddress = (settings.useSSDP != false) ? settings.selectedDiscoveredBridge : settings.bridgeIP
    state.ipAddress = ipAddress
    if (logEnable == true) log.debug "  IP address = ${state.ipAddress}"
@@ -676,7 +683,7 @@ def pageLinkBridge() {
                }
          }
          else {
-               if (getChildDevice("${DNI_PREFIX}/${app.id}")) {
+               if (getChildDevice("${DNI_PREFIX}/${app.id}") && state.bridgeMAC) {
                   state.bridgeLinked = true
                }
                if (!state.bridgeLinked || !getChildDevice("${DNI_PREFIX}/${app.id}")) {
@@ -1714,7 +1721,7 @@ void parseBridgeInfoResponse(resp, Map data) {
          if (logEnable == true) log.debug "  Adding Bridge with ID $bridgeID ($friendlyBridgeName) to list of discovered Bridges"
          if (!state.discoveredBridges) state.discoveredBridges = []
          if (!(state.discoveredBridges.any { it.containsKey(ipAddress) })) {
-            state.discoveredBridges.add([(ipAddress): "${friendlyBridgeName} - ${bridgeID}"])
+            state.discoveredBridges.add([(ipAddress): "${friendlyBridgeName} - ${bridgeID} (${ipAddress})"])
          }
       }
       else { // Bridge already added, so likely added with discovery; check if IP changed

@@ -14,9 +14,10 @@
  *
  * =======================================================================================
  *
- *  Last modified: 2025-09-07
+ *  Last modified: 2025-09-20
  *
  *  Changelog:
+ *  v5.3.5  - Fix logging typo
  *  v5.3.4  - Changes to accommodate HTTPS by default
  *  v5.3.1 - Implement async HTTP call queueing from child drivers through parent app
  *  v5.3.0  - Use V2 for most commands, parse 0 mired as 0 K
@@ -263,7 +264,7 @@ void createEventsFromMapV1(Map bridgeCommandMap, Boolean isFromBridge = false, S
       return
    }
    Map bridgeMap = bridgeCommandMap
-   if (logEnable == true) log.debug "createEventsFromMapV1(): reate events from map${isFromBridge ? ' from Bridge' : ''}: ${bridgeMap}"
+   if (logEnable == true) log.debug "createEventsFromMapV1(): create events from map${isFromBridge ? ' from Bridge' : ''}: ${bridgeMap}"
    if (!isFromBridge && keysToIgnoreIfSSEEnabledAndNotFromBridge && parent.getEventStreamOpenStatus() == true) {
       bridgeMap.keySet().removeAll(keysToIgnoreIfSSEEnabledAndNotFromBridge)
       if (logEnable == true) log.debug "Map after ignored keys removed: ${bridgeMap}"
