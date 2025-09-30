@@ -716,7 +716,7 @@ void bridgeAsyncGetV2(String callbackMethod, String clipV2Path, Map<String,Strin
 
 // "SwitchLevel" commands:
 
-void startLevelChange(String direction) {
+void startLevelChange(String direction, Number speed) {
    if (logEnable == true) log.debug "startLevelChange($direction)..."
    if (getHasV2DNI() == true) {
       Map cmd = [
@@ -727,8 +727,7 @@ void startLevelChange(String direction) {
    }
    else {
       Map cmd = ["bri": (direction == "up" ? 254 : 1),
-               "transitiontime": ((settings["levelChangeRate"] == "fast" || !settings["levelChangeRate"]) ?
-                                    30 : (settings["levelChangeRate"] == "slow" ? 60 : 45))]
+            "transitiontime": speed / 100]
       sendBridgeCommandV1(cmd, false) 
    }
 }
